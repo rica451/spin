@@ -11,8 +11,9 @@ from pathlib import Path
 from tqdm import tqdm
 from datetime import timedelta
 from accelerate.utils import InitProcessGroupKwargs
-
+import torch.optim as optim
 import warnings
+
 warnings.filterwarnings("ignore")
 
 kwargs = InitProcessGroupKwargs(timeout=timedelta(seconds=36000))
@@ -49,12 +50,15 @@ def prepare_prompts(prompts, tokenizer, batch_size=4):
     return batches_tok
 
 def main():
+    
     args = parse_arguments()
     model_path = args.model
     data_frac = args.data_frac
     batch_size = args.batch_size
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    time_num = 0
+    time_all = 0
 
     # load a base model and tokenizer
     model = AutoModelForCausalLM.from_pretrained(
@@ -62,12 +66,16 @@ def main():
         device_map={"": accelerator.process_index},
         torch_dtype=torch.bfloat16,
     )
+    optimizer = optim.Adam(model.parameters(), lr=0.001)
     tokenizer = AutoTokenizer.from_pretrained(model_path)   
     tokenizer.pad_token = tokenizer.eos_token
 
     # load data
+    
     data = load_dataset(args.input_dir, split=args.split)
     data = data.shuffle(seed=42)
+    data_ = data
+    
     if args.frac_len > 0:
         sub_len = args.frac_len 
         if sub_len*(data_frac+1) > len(data):
@@ -77,7 +85,9 @@ def main():
     else:
         data = data[:]['real']
 
-    prompts_all = ["### Instruction: " + data[idx][0]['content'] + "\n\n### Response: " for idx in range(len(data))]
+    # prompts_all = ["### Instruction: " + data[idx][0]['content'] + "\n\n### Response: " for idx in range(len(data))]
+    prompts_all = [data[idx][0]['content'] for idx in range(len(data))]
+
     prompts_old = [data[idx][0]['content'] for idx in range(len(data))]
     corrects_all = [data[idx][1]['content'] for idx in range(len(data))]
 
@@ -90,9 +100,25 @@ def main():
         results = []
         prompt_batches=prepare_prompts(prompts, tokenizer, batch_size=args.batch_size)
 
-        for prompts_tokenized in tqdm(prompt_batches):
+        # scaler = torch.GradScaler()
+        accumulation_steps = 4  # 累积步数
+        tokens = []
+
+
+
+        for i,prompts_tokenized in tqdm(enumerate(prompt_batches)):
             # set max_new_tokens smaller for faster inference
+            # with torch.autocast(device_type='cuda'):
+            tokens = tokenizer.tokenize(data_[i]['real'][0]['content'])
+            if len(tokens) > 4096:
+                continue
+                # start_time = time.time()
             outputs_tokenized=model.generate(**prompts_tokenized, max_new_tokens=256, pad_token_id=tokenizer.eos_token_id)
+                # end_time = time.time()
+                # elapsed_time_ms = (end_time - start_time) * 1000  # 计算毫秒时间间隔
+                # time_num += 1
+                # time_all += elapsed_time_ms
+                
 
             # remove prompt from gen. tokens
             outputs_tokenized=[ tok_out[len(tok_in):] 
@@ -100,6 +126,12 @@ def main():
             # decode gen. tokens 
             outputs=tokenizer.batch_decode(outputs_tokenized)
             results.extend(outputs)
+            torch.cuda.empty_cache()
+            if (i + 1) % accumulation_steps == 0:
+                # 执行优化步骤
+                optimizer.step()
+                optimizer.zero_grad()
+             # print(f"Time elapsed: {time_all/time_num}ms")
 
     # collect results from all the GPUs and remove paddings
     results_gathered=gather_object(results)
@@ -110,7 +142,7 @@ def main():
         print(f"time elapsed: {timediff}")
 
         # collecting data
-        for idx in range(len(corrects_all)):
+        for idx in range(len(results)):
             d = {"real": [{"role": "user", "content": prompts_old[idx]}, {"role": "assistant", "content": corrects_all[idx]}], "generated": [{"role": "user", "content": prompts_old[idx]}, {"role": "assistant", "content": results[idx]}]}
             if args.split == 'test':
                 filename = f"{args.output_dir}/loser_{data_frac}_test.jsonl"

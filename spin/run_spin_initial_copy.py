@@ -7,7 +7,7 @@ import sys
 import torch
 import transformers
 from transformers import AutoModelForCausalLM, set_seed
-from peft import LoraConfig, get_peft_model  # 新增导入
+from accelerate import init_empty_weights, load_checkpoint_and_dispatch
 from accelerate import Accelerator
 from alignment import (
     DataArguments,
@@ -25,7 +25,6 @@ from peft import PeftConfig, PeftModel
 from alignment import SPINTrainer
 from torch.utils.data import Subset
 import re
-# import bitsandbytes as bnb  # 新增的导入
 
 def apply_chat_template(
     example, tokenizer, task, assistant_prefix="<|assistant|>\n"
@@ -60,11 +59,10 @@ def apply_chat_template(
 
 logger = logging.getLogger(__name__)
 
-
 def main():
     parser = H4ArgumentParser((ModelArguments, DataArguments, SPINConfig))
     model_args, data_args, training_args = parser.parse()
-    
+
     #######
     # Setup
     #######
@@ -122,47 +120,24 @@ def main():
             {"text_prompt": "prompt", "text_real": "real", "text_generated": "generated"}
         )
 
-    ##########################
-    # Load model with 8-bit precision
-    ##########################
     torch_dtype = (
         model_args.torch_dtype if model_args.torch_dtype in ["auto", None] else getattr(torch, model_args.torch_dtype)
     )
     quantization_config = get_quantization_config(model_args)
 
-    model_kwargs = dict(
-        revision=model_args.model_revision,
-        trust_remote_code=model_args.trust_remote_code,
-        use_flash_attention_2=model_args.use_flash_attention_2,
-        torch_dtype=torch_dtype,
-        use_cache=False if training_args.gradient_checkpointing else True,
-        device_map=get_kbit_device_map() if quantization_config is not None else None,
-        quantization_config=quantization_config,
-        load_in_4bit=True  # 这里启用 4-bit 量化
+    # Offload the model to CPU/GPU
+    with init_empty_weights():
+        model = AutoModelForCausalLM.from_pretrained(model_args.model_name_or_path)
+
+    model = load_checkpoint_and_dispatch(
+        model,
+        checkpoint='/workspace/hf_home/hub/models--rica40325--lora32_third_step/snapshots/7e57e80b92545f73e322a3621c06d3d7e7a27726',  # Use the path of the model
+        device_map="auto",  # Automatically decide where to put layers (GPU/CPU)
+        offload_folder="offload",  # Folder for storing offloaded layers
+        offload_state_dict=True,   # Enable offloading state_dict to avoid GPU memory overflow
     )
 
-    # 使用 4-bit 量化加载模型
-    model = AutoModelForCausalLM.from_pretrained(
-        model_args.model_name_or_path,
-        **model_kwargs
-    )
-    peft_config = LoraConfig(
-        r=32,  # LoRA rank
-        lora_alpha=16,
-        lora_dropout=0.1,
-        bias="none",
-        task_type="CAUSAL_LM"  # 任务类型：Causal Language Modeling
-    )
-    model = get_peft_model(model, peft_config)
     ref_model = model
-    ref_model_kwargs = model_kwargs
-
-    # 如果使用 PEFT，参考模型可以设置为 None
-    if model_args.use_peft is True:
-        ref_model = None
-        ref_model_kwargs = None
-    # for param in model.parameters():
-    #     print(param.requires_grad)
 
     #########################
     # Instantiate spin trainer
@@ -170,6 +145,8 @@ def main():
     spin_trainer = SPINTrainer(
         model,
         ref_model,
+        # model_init_kwargs={},
+        # ref_model_init_kwargs={},
         args=training_args,
         beta=training_args.beta,
         train_dataset=raw_datasets["train"],
